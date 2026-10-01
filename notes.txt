@@ -1,0 +1,673 @@
+COUNTING SET BITS IN A uint32_t  --  HW2-1 NOTES
+================================================
+
+Task: write  int countBits(uint32_t integer);  that returns how many bits
+are 1 in the number, and print the result for every number from 0 to 255.
+
+Files
+-----
+  C:\esp\hw2-1\main\main.c          current version (Method 1, Kernighan)
+  C:\esp\hw2-1\main_swar_backup.c   backup of the advanced version (Method 2, SWAR)
+
+To switch versions, copy the file you want over main\main.c, then run
+"idf.py build". The backup sits outside main\, so the build ignores it.
+
+
+METHOD 1: BRIAN KERNIGHAN'S METHOD (simple, current version)
+============================================================
+
+    int countBits(uint32_t integer)
+    {
+        int count = 0;
+
+        while (integer != 0) {
+            integer = integer & (integer - 1);   /* remove the lowest 1 bit */
+            count++;
+        }
+
+        return count;
+    }
+
+Idea
+----
+Each pass through the loop removes one 1 bit from the number, and count
+records how many were removed. When the number reaches 0, all the 1s are
+gone, so count is the answer.
+
+Why  integer & (integer - 1)  removes the lowest 1 bit
+-------------------------------------------------------
+Subtracting 1 turns the lowest 1 into 0 and turns all the 0s to its right
+into 1s. ANDing that with the original number clears the lowest 1 and
+leaves every other bit as it was.
+
+Example with 12 (binary 1100):
+
+    pass   integer   integer - 1   integer & (integer - 1)   count
+    ----   -------   -----------   -----------------------   -----
+     1      1100        1011               1000                1
+     2      1000        0111               0000                2
+    stop    0000                                               2   <- answer
+
+12 has two 1 bits, so the loop ran twice.
+
+Why it is efficient
+-------------------
+The loop runs once per 1 bit, not once per bit position:
+  - 0 takes no passes, and 128 (10000000) takes 1.
+  - The worst case is 32 passes, for 0xFFFFFFFF, where every bit is set.
+  - The obvious "check each of the 32 bits" loop always takes 32 passes.
+
+
+METHOD 2: SWAR -- "SIMD WITHIN A REGISTER" (advanced, backup version)
+=====================================================================
+
+    int countBits(uint32_t integer)
+    {
+        integer = integer - ((integer >> 1) & 0x55555555u);                 /* 2-bit sums */
+        integer = (integer & 0x33333333u) + ((integer >> 2) & 0x33333333u); /* 4-bit sums */
+        integer = (integer + (integer >> 4)) & 0x0F0F0F0Fu;                 /* 8-bit sums */
+        return (int)((integer * 0x01010101u) >> 24);                        /* add bytes  */
+    }
+
+Idea
+----
+This method doesn't check the bits one at a time. It treats the 32-bit
+number as many small counters side by side, adds neighbouring counters
+together, and doubles the counter width at each step:
+1 bit -> 2 bits -> 4 bits -> 8 bits. A final multiply adds the four 8-bit
+counters into one total.
+
+Worked example: 0x12345678, which has 13 set bits.
+
+    x = 0001 0010 0011 0100 0101 0110 0111 1000     (0x12345678)
+
+Step 1: count each 2-bit pair
+-----------------------------
+    integer = integer - ((integer >> 1) & 0x55555555u);
+
+A 2-bit pair with bits "a b" has the value 2a + b, but the count we want
+is a + b. The difference is exactly a, so the code subtracts a:
+  - integer >> 1 shifts every pair's high bit a into that pair's low position.
+  - & 0x55555555 (binary 0101...) keeps only those shifted bits, so each
+    pair of the mask holds just its own a.
+  - Subtracting gives 2a + b - a = a + b in every pair at once. No pair
+    borrows from its neighbour, because the result can't go below zero.
+
+    pair    value - a    count
+    ----    ---------    -----
+     00       0 - 0        0
+     01       1 - 0        1
+     10       2 - 1        1
+     11       3 - 1        2
+
+    x = 00 01 00 01 00 10 01 00 01 01 01 01 01 10 01 00   (0x11245564)
+        each 2-bit field is now the number of 1s in that pair
+
+Step 2: add pairs into 4-bit counts
+-----------------------------------
+    integer = (integer & 0x33333333u) + ((integer >> 2) & 0x33333333u);
+
+The mask 0x33333333 is binary 0011 0011..., so it keeps the low pair of
+each 4-bit group (a "nibble"):
+  - integer & 0x33333333 gives the low pair of each nibble.
+  - (integer >> 2) & 0x33333333 gives the high pair, moved down into the
+    same position.
+  - Adding them gives each nibble's count.
+
+Both halves have to be masked BEFORE adding. Two pair counts can add up
+to 4, and 4 needs 3 bits, which is more than a 2-bit slot holds. Without
+the masks the sum would spill into the neighbouring slot.
+
+    x = 0001 0001 0010 0001 0010 0010 0011 0001   (0x11212231)
+         1    1    2    1    2    2    3    1      <- bit count of each original nibble
+
+Step 3: add nibbles into 8-bit counts
+-------------------------------------
+    integer = (integer + (integer >> 4)) & 0x0F0F0F0Fu;
+
+This is the same idea as step 2 with one mask instead of two. Each nibble
+count is at most 4, so two of them add up to at most 8, which still fits
+in 4 bits. The sum can't carry into the next nibble, so the code adds
+first and then masks once. The mask 0x0F0F0F0F clears the leftover upper
+nibbles.
+
+    x = 00000010 00000011 00000100 00000100   (0x02030404)
+           2        3        4        4       <- bit count of each byte
+
+Step 4: add the four bytes with one multiply
+--------------------------------------------
+    return (int)((integer * 0x01010101u) >> 24);
+
+Multiplying by 0x01010101 is the same as adding four shifted copies of
+the number:
+
+      x          ->  [ b3 ][ b2 ][ b1 ][ b0 ]
+    + x << 8     ->  [ b2 ][ b1 ][ b0 ]
+    + x << 16    ->  [ b1 ][ b0 ]
+    + x << 24    ->  [ b0 ]
+      -------------------------------------
+      top byte   =   b3 + b2 + b1 + b0  = 2 + 3 + 4 + 4 = 13
+
+The top byte ends up holding the sum of all four byte counts. The total
+is at most 32, which fits easily in a byte, so no carries corrupt it.
+Anything that overflows past bit 31 is simply dropped. >> 24 moves the
+top byte down, and the result is 13.
+
+Why it is fast
+--------------
+The whole function is about 12 simple operations (shifts, ANDs, adds, a
+subtract and one multiply), with no loops or ifs. It takes the same time
+for 0 as for 0xFFFFFFFF. The ESP32 has a hardware multiplier, so the
+multiply in step 4 is cheap.
+
+Why not __builtin_popcount?
+The ESP32 has no bit-count instruction, so __builtin_popcount turns into
+a call to a slower library routine.
+
+
+COMPARISON
+==========
+
+    method        loop passes             easy to read?
+    ---------     ---------------------   -------------
+    bit-by-bit    always 32               yes
+    Kernighan     one per 1 bit (0-32)    yes
+    SWAR          none, ~12 operations    no, but fastest in the worst case
+
+
+THE MAIN PROGRAM (same in both versions)
+========================================
+
+    void app_main(void)
+    {
+        for (uint32_t i = 0; i <= 255; i++) {
+            printf("%3lu: %d\n", (unsigned long)i, countBits(i));
+        }
+    }
+
+  - Loops over 0-255 and prints each number next to its bit count.
+  - The number is cast to unsigned long so it matches %lu for the ESP32's
+    compiler.
+  - %3lu pads numbers to 3 characters so the columns line up.
+  - When app_main returns, ESP-IDF ends that task, and the board sits idle.
+
+Output: one line per number, from "  0: 0" through "255: 8",
+for example "  7: 3" and "128: 1".
+
+
+BUILD AND RUN
+=============
+  1. Open the "IDF_v6.1_Powershell" shortcut on the desktop.
+  2. cd C:\esp\hw2-1
+  3. idf.py build
+  4. idf.py -p COMx flash monitor    (COMx = board's port in Device Manager)
+  5. Press Ctrl+] to exit the monitor.
+
+Tip: if you create a project by copying another one, leave out its build\
+folder. Otherwise the build fails with "Build directory ... configured
+for project ...". Fix it with "idf.py fullclean".
+
+
+
+MULTIPLYING TWO uint16_t WITHOUT *  --  HW2-2 NOTES
+===================================================
+
+Task: write  uint32_t multiply(uint16_t integer1, uint16_t integer2);
+that returns integer1 x integer2 without using the * operator, and print
+the result for every combination of numbers from 0 to 10.
+
+File
+----
+  C:\esp\hw2-2\main\main.c
+
+
+THE CODE: SHIFT-AND-ADD METHOD
+==============================
+
+    uint32_t multiply(uint16_t integer1, uint16_t integer2)
+    {
+        uint32_t result = 0;
+        uint32_t shifted = integer1;   /* 32 bits so the shifts don't overflow */
+
+        while (integer2 != 0) {
+            if (integer2 & 1) {        /* lowest bit of integer2 is 1 */
+                result += shifted;
+            }
+            shifted <<= 1;             /* integer1 x 2, x 4, x 8, ... */
+            integer2 >>= 1;            /* move on to the next bit */
+        }
+
+        return result;
+    }
+
+Idea
+----
+This is long multiplication done in binary. Any number can be written as
+a sum of powers of 2. For example, 5 = 101 = 4 + 1, so
+
+    6 x 5 = 6 x 4 + 6 x 1
+
+The loop goes through the bits of integer2 from lowest to highest:
+  - If the bit is 1, it adds the current value of shifted to result.
+  - After each bit, it doubles shifted with "<<= 1" (shifting left by 1
+    multiplies by 2), so it holds 6, 12, 24, ...
+  - It shifts integer2 right with ">>= 1" so the next bit becomes the
+    lowest one, and stops when integer2 reaches 0.
+
+"integer2 & 1" keeps only the lowest bit, so it is 1 when that bit is
+set and 0 otherwise.
+
+Example: 6 x 5  (5 = binary 101)
+
+    pass   integer2   lowest bit   shifted   result
+    ----   --------   ----------   -------   ----------
+     1       101      1 -> add        6      0 + 6  = 6
+     2        10      0 -> skip      12      6
+     3         1      1 -> add       24      6 + 24 = 30
+    stop       0                             30   <- answer
+
+Why it is efficient
+-------------------
+  - The loop runs at most 16 times, once per bit of integer2, and stops
+    early when no 1 bits are left. Multiplying by 10 (1010) takes only
+    4 passes.
+  - Each pass uses only a bit test, a shift and an add.
+  - Adding integer1 to itself integer2 times would also avoid *, but it
+    can take up to 65,535 passes.
+
+Why 32 bits for shifted and result?
+The biggest answer, 65535 x 65535 = 4,294,836,225, doesn't fit in 16
+bits. shifted is also 32 bits so that doubling it up to 15 times doesn't
+lose its top bits.
+
+
+THE MAIN PROGRAM
+================
+
+    void app_main(void)
+    {
+        for (uint16_t a = 0; a <= 10; a++) {
+            for (uint16_t b = 0; b <= 10; b++) {
+                printf("%2u x %2u = %3lu\n", a, b, (unsigned long)multiply(a, b));
+            }
+        }
+    }
+
+  - Two nested loops go through every pair (a, b) from 0 to 10, which is
+    11 x 11 = 121 combinations.
+  - %2u and %3lu pad the numbers so the columns line up.
+  - The result is cast to unsigned long so it matches %lu for the ESP32's
+    compiler.
+
+Output:
+
+     0 x  0 =   0
+     0 x  1 =   0
+     ...
+     6 x  5 =  30
+     ...
+    10 x 10 = 100
+
+
+BUILD AND RUN
+=============
+Same as HW2-1, but in C:\esp\hw2-2:
+  cd C:\esp\hw2-2
+  idf.py build
+  idf.py -p COMx flash monitor
+
+
+
+ADDING TWO uint16_t WITHOUT + OR -  --  HW2-3 NOTES
+===================================================
+
+Task: write  uint32_t add(uint16_t integer1, uint16_t integer2);
+that returns integer1 + integer2 without using the + or - operators
+(using logical operators like OR/AND/XOR instead), and print the result
+for every combination of numbers from 0 to 10.
+
+File
+----
+  C:\esp\hw2-3\main\main.c
+
+
+THE CODE: XOR/AND CARRY METHOD
+==============================
+
+    uint32_t add(uint16_t integer1, uint16_t integer2)
+    {
+        uint32_t sum = integer1;
+        uint32_t carry = integer2;
+
+        while (carry != 0) {
+            uint32_t carries = (sum & carry) << 1;   /* columns that carry a 1 */
+            sum = sum ^ carry;                       /* add without carrying   */
+            carry = carries;                         /* add the carries next   */
+        }
+
+        return sum;
+    }
+
+Idea
+----
+This is how an adder circuit works in hardware. When you add one column
+of bits, there are two parts to the answer:
+
+     a   b   a XOR b (bit that stays)   a AND b (carry)
+    ---  ---  ------------------------   ---------------
+     0   0              0                      0
+     0   1              1                      0
+     1   0              1                      0
+     1   1              0                      1  -> goes to the next column
+
+  - XOR (^) gives the sum of every column with the carries ignored.
+  - AND (&) finds the columns that produce a carry, and "<< 1" moves each
+    carry one column to the left, where it belongs.
+  - Adding those carries can create new carries, so the loop repeats: the
+    XOR result becomes the new sum and the shifted carries become the new
+    carry. When carry reaches 0, sum is the answer.
+
+Why "carries" is computed first: the carries must come from the OLD
+values of sum and carry, so they are worked out before sum is changed.
+
+Example: 5 + 3  (0101 + 0011)
+
+    pass   sum    carry   sum ^ carry   (sum & carry) << 1
+    ----   ----   -----   -----------   ------------------
+     1     0101   0011       0110              0010
+     2     0110   0010       0100              0100
+     3     0100   0100       0000              1000
+     4     0000   1000       1000              0000   -> stop
+
+The result is 1000 = 8.
+
+Why it is efficient
+-------------------
+  - Each pass is just an AND, a shift and an XOR, so the work happens
+    across all 16 bits at once.
+  - The loop runs once for each time a carry has to move further left,
+    not once per bit. Many sums finish in 1 or 2 passes, and 5 + 3 took 4.
+  - The worst case is 17 passes, for something like 65535 + 1, where the
+    carry moves through every bit.
+
+Why 32 bits for sum and carry?
+The biggest answer, 65535 + 65535 = 131,070, needs 17 bits, which is
+more than a uint16_t holds.
+
+
+THE MAIN PROGRAM
+================
+
+    void app_main(void)
+    {
+        for (uint16_t a = 0; a <= 10; a++) {
+            for (uint16_t b = 0; b <= 10; b++) {
+                printf("%2u + %2u = %2lu\n", a, b, (unsigned long)add(a, b));
+            }
+        }
+    }
+
+  - Two nested loops go through every pair (a, b) from 0 to 10, which is
+    11 x 11 = 121 combinations.
+  - %2u and %2lu pad the numbers so the columns line up.
+  - The result is cast to unsigned long so it matches %lu for the ESP32's
+    compiler.
+  - Note: a++ and b++ use addition. The task only restricts the add()
+    function. If no + is allowed anywhere, change them to a = add(a, 1)
+    and b = add(b, 1).
+
+Output:
+
+     0 +  0 =  0
+     ...
+     5 +  3 =  8
+     ...
+    10 + 10 = 20
+
+
+BUILD AND RUN
+=============
+Same as HW2-1, but in C:\esp\hw2-3:
+  cd C:\esp\hw2-3
+  idf.py build
+  idf.py -p COMx flash monitor
+
+
+
+BIT MANIPULATION (SET / CLEAR / FLIP)  --  HW3-1 NOTES
+======================================================
+
+Task: print in hexadecimal the result of setting, clearing and flipping
+single bits of 16-bit words, and several bits at once (using a bitmask)
+of 8-bit words. Bits are counted from 1, where the 1st bit is the LSB.
+
+File
+----
+  C:\esp\hw3-1\main\main.c
+
+
+THE THREE OPERATIONS
+====================
+
+    x = x | mask;    set:   OR with 1 makes the bit 1
+    x = x & mask;    clear: the mask has a 0 at the bit to clear and 1s
+                            everywhere else, so AND makes only that bit 0
+    x = x ^ mask;    flip:  XOR with 1 inverts the bit
+
+Bits where the mask has a 0 (for OR and XOR) or a 1 (for AND) stay as
+they were, so only the chosen bits change.
+
+Making a mask
+-------------
+Bit n (1st bit = LSB) has the value 2^(n-1):
+
+    bit:    8    7    6    5    4    3    2    1
+    value:  0x80 0x40 0x20 0x10 0x08 0x04 0x02 0x01
+
+  - To set or flip one bit, use its value (5th bit -> 0x10).
+  - To set or flip several bits at once, add their values together
+    (2nd + 5th -> 0x02 + 0x10 = 0x12). This bitmask changes all of them
+    in one operation.
+  - To clear bits, write the mask with 0s at those bits and 1s everywhere
+    else (clear 4th bit of a 16-bit word -> 1111 1111 1111 0111 = 0xFFF7).
+
+  - 16-bit words use uint16_t and 8-bit words use uint8_t.
+  - %04X prints a 16-bit value as 4 hex digits and %02X prints an 8-bit
+    value as 2, padded with zeros.
+
+
+EACH OPERATION
+==============
+
+1. Set the 3rd bit of 0x2105          a = a | 0x0004;
+
+       0x2105 = 0010 0001 0000 0101
+     | 0x0004 = 0000 0000 0000 0100
+       result = 0010 0001 0000 0101 = 0x2105
+
+   The 3rd bit was already 1, so the value does not change.
+
+2. Clear the 4th bit of 0x21FF        b = b & 0xFFF7;
+
+       0x21FF = 0010 0001 1111 1111
+     & 0xFFF7 = 1111 1111 1111 0111
+       result = 0010 0001 1111 0111 = 0x21F7
+
+3. Flip the 5th bit of 0x2100         c = c ^ 0x0010;
+
+       0x2100 = 0010 0001 0000 0000
+     ^ 0x0010 = 0000 0000 0001 0000
+       result = 0010 0001 0001 0000 = 0x2110
+
+4. Set the 2nd and 5th bits of 0x80   d = d | 0x12;
+
+       0x80   = 1000 0000
+     | 0x12   = 0001 0010
+       result = 1001 0010 = 0x92
+
+5. Clear the 1st and 7th bits of 0xFF e = e & 0xBE;
+
+   The 1st and 7th bits are 0100 0001 (0x41). The mask keeps every
+   other bit: 1011 1110 (0xBE).
+
+       0xFF   = 1111 1111
+     & 0xBE   = 1011 1110
+       result = 1011 1110 = 0xBE
+
+6. Flip the 3rd and 4th bits of 0x00  f = f ^ 0x0C;
+
+       0x00   = 0000 0000
+     ^ 0x0C   = 0000 1100
+       result = 0000 1100 = 0x0C
+
+Output:
+
+    Set 3rd bit of 0x2105:        0x2105
+    Clear 4th bit of 0x21FF:      0x21F7
+    Flip 5th bit of 0x2100:       0x2110
+    Set 2nd & 5th bits of 0x80:   0x92
+    Clear 1st & 7th bits of 0xFF: 0xBE
+    Flip 3rd & 4th bits of 0x00:  0x0C
+
+
+BUILD AND RUN
+=============
+Same as HW2-1, but in C:\esp\hw3-1:
+  cd C:\esp\hw3-1
+  idf.py build
+  idf.py -p COMx flash monitor
+
+
+
+BMP280 TEMPERATURE COMPENSATION  --  HW3-3 NOTES
+================================================
+
+Task: set up the BMP280 typedefs and calibration values, copy the
+bmp280_compensate_T_int32() function from the BMP280 datasheet (pages
+22 and 44), and use it to turn a raw reading of 550000 into an actual
+temperature.
+
+File
+----
+  C:\esp\hw3-3\main\main.c
+
+
+BACKGROUND
+==========
+The BMP280 sensor does not output a temperature directly. It gives a raw
+number (adc_T) that has to be corrected with calibration values that are
+different for every sensor. These values (dig_T1, dig_T2, dig_T3) are
+normally read from the sensor's memory. In this homework they are given
+as fixed numbers.
+
+
+TYPEDEFS AND GLOBAL VARIABLES
+=============================
+
+    typedef int32_t BMP280_S32_t;     signed 32-bit
+    typedef int64_t BMP280_S64_t;     signed 64-bit
+    typedef uint32_t BMP280_U32_t;    unsigned 32-bit
+    typedef uint64_t BMP280_U64_t;    unsigned 64-bit
+
+    unsigned short dig_T1 = 27504;
+    short dig_T2 = 26435;
+    short dig_T3 = -1000;
+
+  - A typedef gives an existing type a new name. BMP280_S32_t means
+    exactly the same thing as int32_t. Bosch uses these names so the
+    datasheet code works on any compiler.
+  - Only BMP280_S32_t is used here. The others are for the pressure
+    function, which is not part of this task.
+  - dig_T1 is unsigned (it is never negative). dig_T2 and dig_T3 are
+    signed, and dig_T3 is negative.
+
+
+THE FUNCTION (copied from the datasheet)
+========================================
+
+    BMP280_S32_t t_fine;
+    BMP280_S32_t bmp280_compensate_T_int32(BMP280_S32_t adc_T)
+    {
+        BMP280_S32_t var1, var2, T;
+        var1 = ((((adc_T >> 3) - ((BMP280_S32_t)dig_T1 << 1))) * ((BMP280_S32_t)dig_T2)) >> 11;
+        var2 = (((((adc_T >> 4) - ((BMP280_S32_t)dig_T1)) * ((adc_T >> 4) - ((BMP280_S32_t)dig_T1))) >> 12) *
+                ((BMP280_S32_t)dig_T3)) >> 14;
+        t_fine = var1 + var2;
+        T = (t_fine * 5 + 128) >> 8;
+        return T;
+    }
+
+  - The function only uses integers, which is faster than floating
+    point on small microcontrollers.
+  - x >> n divides by 2^n (rounding down) and x << n multiplies by 2^n.
+    For example, >> 11 divides by 2048 and << 1 multiplies by 2.
+  - (BMP280_S32_t)dig_T1 turns the 16-bit calibration values into 32-bit
+    signed numbers before the math, so the results fit and negative
+    numbers work.
+  - var1 is the main (linear) correction and var2 is a smaller (squared)
+    correction.
+  - t_fine is a global variable because the datasheet's pressure function
+    also needs it.
+  - The result T is in hundredths of a degree: 5123 means 51.23 DegC.
+  - "+ 128" before ">> 8" rounds to the nearest value instead of always
+    rounding down (128 is half of 256).
+
+
+STEP BY STEP FOR adc_T = 550000
+===============================
+
+  var1:
+    adc_T >> 3        = 550000 / 8         = 68750
+    dig_T1 << 1       = 27504 x 2          = 55008
+    68750 - 55008                          = 13742
+    13742 x 26435                          = 363269770
+    >> 11  (/ 2048)                        = 177377
+
+  var2:
+    adc_T >> 4        = 550000 / 16        = 34375
+    34375 - 27504                          = 6871
+    6871 x 6871                            = 47210641
+    >> 12  (/ 4096)                        = 11526
+    11526 x (-1000)                        = -11526000
+    >> 14  (/ 16384, rounds down)          = -704
+
+  t_fine = 177377 + (-704)                 = 176673
+
+  T = (176673 x 5 + 128) >> 8
+    = 883493 / 256                         = 3451   -> 34.51 DegC
+
+Check: the datasheet's own example (adc_T = 519888) gives T = 2508,
+which is 25.08 DegC, the same answer the datasheet shows.
+
+
+THE MAIN PROGRAM
+================
+
+    void app_main(void)
+    {
+        BMP280_S32_t adc_T = 550000;   // raw temperature reading
+
+        BMP280_S32_t T = bmp280_compensate_T_int32(adc_T);
+
+        printf("Raw value: %ld\n", (long)adc_T);
+        printf("T = %ld  ->  %ld.%02ld DegC\n", (long)T, (long)(T / 100), (long)(T % 100));
+    }
+
+  - T / 100 gives the whole degrees (34) and T % 100 gives the
+    hundredths (51). %02ld pads with a zero, so 5 hundredths prints as
+    ".05" and not ".5".
+  - The values are cast to long to match %ld, the same reason as in
+    HW2-3.
+
+Output:
+
+    Raw value: 550000
+    T = 3451  ->  34.51 DegC
+
+
+BUILD AND RUN
+=============
+Same as HW2-1, but in C:\esp\hw3-3:
+  cd C:\esp\hw3-3
+  idf.py build
+  idf.py -p COMx flash monitor
